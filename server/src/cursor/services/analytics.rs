@@ -14,7 +14,7 @@ use crate::{api::cursor::proxy, Error, Result};
 
 pub const BOOTSTRAP_STATSIG_PATH: &str = "/aiserver.v1.AnalyticsService/BootstrapStatsig";
 const AGENT_RETRIES_GATE: &str = "nal_agent_retries";
-const LOCAL_RULE: &str = "local_enabled";
+const LOCAL_LOOP_GATE: &str = "agent_host_local_loop";
 
 #[derive(Clone, PartialEq, Message)]
 struct BootstrapStatsigResponse {
@@ -51,7 +51,7 @@ fn patch_upstream(response: proxy::BufferedResponse) -> Result<Response<Body>> {
     let (framed, payload) = unary_payload(&response.body)?;
     let mut message = BootstrapStatsigResponse::decode(payload)?;
     let mut config = serde_json::from_str::<Value>(&message.config)?;
-    enable_agent_retries(&mut config)?;
+    patch_agent_gates(&mut config)?;
     message.config = serde_json::to_string(&config)?;
     Ok(response.with_body(encode_unary(&message, framed)))
 }
@@ -74,7 +74,7 @@ fn local_response() -> Result<Response<Body>> {
         },
         "time": generated_at_ms
     });
-    enable_agent_retries(&mut config)?;
+    patch_agent_gates(&mut config)?;
     let message = BootstrapStatsigResponse {
         config: serde_json::to_string(&config)?,
         generated_at_ms,
@@ -96,8 +96,9 @@ fn local_response() -> Result<Response<Body>> {
     Ok(response)
 }
 
-fn enable_agent_retries(config: &mut Value) -> Result<()> {
-    let gate_key = statsig_key(config, AGENT_RETRIES_GATE);
+fn patch_agent_gates(config: &mut Value) -> Result<()> {
+    let retries_key = statsig_key(config, AGENT_RETRIES_GATE);
+    let local_loop_key = statsig_key(config, LOCAL_LOOP_GATE);
     let root = config
         .as_object_mut()
         .ok_or_else(|| Error::Protocol("Statsig bootstrap config must be an object".into()))?;
@@ -106,7 +107,9 @@ fn enable_agent_retries(config: &mut Value) -> Result<()> {
         .or_insert_with(|| Value::Object(Map::new()))
         .as_object_mut()
         .ok_or_else(|| Error::Protocol("Statsig feature_gates must be an object".into()))?;
-    gates.insert(gate_key.clone(), enabled_gate(&gate_key));
+    gates.insert(retries_key.clone(), local_gate(&retries_key, true));
+    // This bridge implements AgentService, not the managed RunInference local loop.
+    gates.insert(local_loop_key.clone(), local_gate(&local_loop_key, false));
     Ok(())
 }
 
@@ -127,14 +130,19 @@ fn djb2(value: &str) -> String {
         .to_string()
 }
 
-fn enabled_gate(name: &str) -> Value {
+fn local_gate(name: &str, value: bool) -> Value {
+    let rule = if value {
+        "local_enabled"
+    } else {
+        "local_disabled"
+    };
     json!({
         "name": name,
-        "value": true,
-        "rule_id": LOCAL_RULE,
-        "ruleID": LOCAL_RULE,
-        "group_name": LOCAL_RULE,
-        "groupName": LOCAL_RULE,
+        "value": value,
+        "rule_id": rule,
+        "ruleID": rule,
+        "group_name": rule,
+        "groupName": rule,
         "secondary_exposures": [],
         "secondaryExposures": [],
         "undelegated_secondary_exposures": [],
@@ -173,4 +181,102 @@ fn encode_unary(message: &impl Message, framed: bool) -> Bytes {
     output.put_u32(payload.len() as u32);
     output.extend_from_slice(&payload);
     output.freeze()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::to_bytes, http::HeaderMap};
+
+    #[tokio::test]
+    async fn upstream_bootstrap_disables_local_loop_for_every_hash_and_framing() {
+        for (hash_used, loop_key, retries_key) in [
+            ("none", "agent_host_local_loop", "nal_agent_retries"),
+            ("djb2", "1967931573", "101914982"),
+            (
+                "sha256",
+                "pL49GCl+NNaNm8gwzyKmb8/Gz7VEiiUMVG56Nk3v+d0=",
+                "ifvjhhnfrCEApPQP1Pgv02EJdaWKslFkfOhSOAezhxk=",
+            ),
+        ] {
+            for framed in [false, true] {
+                let config = json!({
+                    "hash_used": hash_used,
+                    "feature_gates": {
+                        (loop_key): { "name": loop_key, "value": true },
+                        (retries_key): { "name": retries_key, "value": false },
+                        "unrelated": { "value": true }
+                    },
+                    "dynamic_configs": { "keep": { "value": { "sample": 42 } } }
+                });
+                let message = BootstrapStatsigResponse {
+                    config: config.to_string(),
+                    generated_at_ms: 42,
+                };
+                let payload = message.encode_to_vec();
+                let mut wire = Vec::new();
+                if framed {
+                    wire.push(0);
+                    wire.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                }
+                wire.extend_from_slice(&payload);
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/proto"),
+                );
+                let response = patch_upstream(proxy::BufferedResponse {
+                    status: StatusCode::OK,
+                    headers,
+                    body: Bytes::from(wire),
+                })
+                .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let content_length = response.headers()[header::CONTENT_LENGTH]
+                    .to_str()
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                assert_eq!(body.len(), content_length);
+                let payload = if framed {
+                    assert_eq!(body[0], 0);
+                    assert_eq!(
+                        u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize,
+                        body.len() - 5
+                    );
+                    &body[5..]
+                } else {
+                    body.as_ref()
+                };
+                let patched = BootstrapStatsigResponse::decode(payload).unwrap();
+                assert_eq!(patched.generated_at_ms, 42);
+                let patched: Value = serde_json::from_str(&patched.config).unwrap();
+                assert_eq!(patched["hash_used"], hash_used);
+                assert_eq!(patched["feature_gates"][loop_key]["value"], false);
+                assert_eq!(patched["feature_gates"][loop_key]["name"], loop_key);
+                assert_eq!(patched["feature_gates"][retries_key]["value"], true);
+                assert_eq!(
+                    patched["feature_gates"]["unrelated"],
+                    config["feature_gates"]["unrelated"]
+                );
+                assert_eq!(patched["dynamic_configs"], config["dynamic_configs"]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_bootstrap_disables_local_loop_and_keeps_agent_retries() {
+        let response = local_response().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let message = BootstrapStatsigResponse::decode(body).unwrap();
+        let config: Value = serde_json::from_str(&message.config).unwrap();
+        assert_eq!(config["hash_used"], "none");
+        assert_eq!(
+            config["feature_gates"]["agent_host_local_loop"]["value"],
+            false
+        );
+        assert_eq!(config["feature_gates"]["nal_agent_retries"]["value"], true);
+    }
 }

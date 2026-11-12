@@ -94,6 +94,170 @@ fn captured_kv_ack_hex_decodes_as_agent_client_message() {
     ));
 }
 
+fn binary_run_message() -> pb::AgentClientMessage {
+    pb::AgentClientMessage {
+        message: Some(pb::agent_client_message::Message::RunRequest(
+            pb::AgentRunRequest {
+                conversation_id: Some("binary-conversation".into()),
+                run_id: Some("binary-request".into()),
+                requested_model: Some(pb::RequestedModel {
+                    model_id: "plugin:binary-test".into(),
+                    ..Default::default()
+                }),
+                action: Some(pb::ConversationAction {
+                    action: Some(pb::conversation_action::Action::UserMessageAction(
+                        pb::UserMessageAction {
+                            user_message: Some(pb::UserMessage {
+                                text: "hello".into(),
+                                message_id: "binary-user".into(),
+                                mode: pb::AgentMode::Agent as i32,
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )),
+    }
+}
+
+#[test]
+fn bidi_append_decodes_hex_and_binary_run_messages() {
+    let message = binary_run_message();
+    for binary in [false, true] {
+        let payload = message.encode_to_vec();
+        let request = ai::BidiAppendRequest {
+            request_id: Some(ai::BidiRequestId {
+                request_id: "binary-request".into(),
+            }),
+            append_seqno: 7,
+            data: if binary {
+                String::new()
+            } else {
+                hex::encode(&payload)
+            },
+            data_binary: if binary { payload } else { Vec::new() },
+        };
+        let decoded = cursor::bidi::decode(&request).unwrap();
+        assert_eq!(decoded.request_id, "binary-request");
+        assert_eq!(decoded.seqno, 7);
+        assert_eq!(decoded.model_id(), Some("plugin:binary-test"));
+        assert_eq!(decoded.conversation_id(), Some("binary-conversation"));
+        assert_eq!(decoded.message, message);
+    }
+}
+
+#[test]
+fn bidi_append_prefers_binary_when_hex_is_also_populated() {
+    let request = ai::BidiAppendRequest {
+        request_id: Some(ai::BidiRequestId {
+            request_id: "binary-request".into(),
+        }),
+        data: "not hex".into(),
+        data_binary: binary_run_message().encode_to_vec(),
+        ..Default::default()
+    };
+    let decoded = cursor::bidi::decode(&request).unwrap();
+    assert_eq!(decoded.model_id(), Some("plugin:binary-test"));
+}
+
+#[test]
+fn bidi_append_rejects_missing_payload_and_malformed_encodings() {
+    let request_id = Some(ai::BidiRequestId {
+        request_id: "invalid-request".into(),
+    });
+    for (data, data_binary) in [("", vec![]), ("not hex", vec![])] {
+        let request = ai::BidiAppendRequest {
+            request_id: request_id.clone(),
+            data: data.into(),
+            data_binary,
+            ..Default::default()
+        };
+        assert!(matches!(
+            cursor::bidi::decode(&request),
+            Err(cursor_server::Error::Protocol(_))
+        ));
+    }
+    let request = ai::BidiAppendRequest {
+        request_id,
+        data: hex::encode(binary_run_message().encode_to_vec()),
+        data_binary: vec![0xff],
+        ..Default::default()
+    };
+    assert!(matches!(
+        cursor::bidi::decode(&request),
+        Err(cursor_server::Error::Decode(_))
+    ));
+
+    let request = ai::BidiAppendRequest {
+        data_binary: binary_run_message().encode_to_vec(),
+        ..Default::default()
+    };
+    assert!(matches!(
+        cursor::bidi::decode(&request),
+        Err(cursor_server::Error::Protocol(_))
+    ));
+}
+
+#[tokio::test]
+async fn bidi_append_binary_run_establishes_local_sse_route() {
+    let (_directory, store) = fixtures::temp_store().await;
+    let assets = PromptAssets::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("prompt/cursor")
+            .as_path(),
+    )
+    .unwrap();
+    let provider = fake_provider::FakeProvider::default();
+    provider.push_pending();
+    let clients = NetworkClients::new(store.clone());
+    let registry = TransportRegistry::new(store, Arc::new(provider), PromptCompiler::new(assets));
+    let router = cursor::router(registry.clone(), clients).unwrap();
+    let request_id = ai::BidiRequestId {
+        request_id: "binary-request".into(),
+    };
+    let request = ai::BidiAppendRequest {
+        request_id: Some(request_id.clone()),
+        data_binary: binary_run_message().encode_to_vec(),
+        ..Default::default()
+    };
+    let response = router
+        .clone()
+        .oneshot(
+            Request::post("/aiserver.v1.BidiService/BidiAppend")
+                .header(header::CONTENT_TYPE, "application/proto")
+                .body(Body::from(request.encode_to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(registry.local("binary-request").await.is_some());
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        router.oneshot(
+            Request::post("/agent.v1.AgentService/RunSSE")
+                .header(header::CONTENT_TYPE, "application/proto")
+                .body(Body::from(request_id.encode_to_vec()))
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("binary append must unblock RunSSE")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/event-stream"
+    );
+    drop(response);
+    registry.shutdown().await;
+}
+
 #[tokio::test]
 async fn bidi_append_gzip_body_is_decompressed_before_protobuf_decode() {
     let (_directory, store) = fixtures::temp_store().await;
